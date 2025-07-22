@@ -1,7 +1,8 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from langchain_core.language_models import BaseChatModel
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import SystemMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -64,9 +65,48 @@ PREDEFINED_STRATEGIES = {
     'narrative_scene': "Split the story into distinct scenes. Each chunk should represent a continuous block of action or dialogue in a single location."
 }
 
+PROMPT_TEMPLATE = PROMPT_TEMPLATE="""
+Your task is to segment the document provided below into logical chunks based on a specific set of criteria.
+
+Your primary goal is to apply the following segmentation logic:
+---
+[INSTRUCTIONS]
+{segmentation_criteria}
+---
+
+After applying this logic, generate the JSON output according to your core system instructions.
+
+CRITICAL REMINDER: 
+- start_chunk and end_chunk must be ACTUAL TEXT WORDS from the document
+- NOT numbers, NOT character positions, NOT indices
+- REAL WORDS that appear in the text
+
+EXAMPLE of what I want:
+```json
+[
+  {{
+    "chunk_index": 0,
+    "start_chunk": "Of course. Here is the complete",
+    "end_chunk": "...how such things are even possible.",
+    "summary_chunk": "Introduction and elevator pitch"
+  }},
+  {{
+    "chunk_index": 1,
+    "start_chunk": "Question 2: Your Dream Job",
+    "end_chunk": "in one way or another.",
+    "summary_chunk": "Discussion about dream job"
+  }}
+]
+```
+
+---
+[DOCUMENT TEXT]
+{document_text}
+---
+"""
 
 class SmartSplitter:
-    def __init__(self, llm: BaseChatModel, max_chunk_size: int = 10000):
+    def __init__(self, llm: BaseChatModel, max_chunk_size: int = 100000):
         self.llm = llm
         self.max_chunk_size = max_chunk_size
 
@@ -93,37 +133,56 @@ class SmartSplitter:
     def _split_chunk(self, text: str, criteria: str) -> List[str]:
         parser = JsonOutputParser(pydantic_object=ChunkList)
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            ("human", "Here is the document:\n\n---\n\n{document}\n\n---\n\nSegment the document based on the following criteria: {segmentation_criteria}")
-        ])
+        SystemMessage(content=SYSTEM_PROMPT),
+        prompt = PromptTemplate(
+            SystemMessage=SYSTEM_PROMPT,
+            template=PROMPT_TEMPLATE,
+            input_variables=["segmentation_criteria", "document_text"],
+            partial_variables={"format_instructions": parser.get_format_instructions()},
+        )
 
         chain = prompt | self.llm | parser
 
         response = chain.invoke({
-            "document": text,
+            "document_text": text,
             "segmentation_criteria": criteria
         })
 
-        return self._reconstruct_chunks(text, response['chunks'])
+        return self._reconstruct_chunks(text, response)
 
-    def _reconstruct_chunks(self, text: str, chunks: List[Chunk]) -> List[str]:
+    def _reconstruct_chunks(self, text: str, chunks: dict) -> List[str]:
         reconstructed_chunks = []
         current_pos = 0
-        for i, chunk_info in enumerate(chunks):
+        chunks_list = chunks['chunks'] if 'chunks' in chunks else chunks
+        for i, chunk_info in enumerate(chunks_list):
             try:
                 # Find the start of the chunk.
-                start_index = text.index(chunk_info.start_chunk, current_pos)
+                start_index = text.index(chunk_info['start_chunk'], current_pos)
 
                 # Find the end of the chunk.
                 # We search from the start_index to ensure we get the correct end marker
                 # in case of duplicate end markers in the text.
-                end_index = text.index(chunk_info.end_chunk, start_index) + len(chunk_info.end_chunk)
+                end_index = text.index(chunk_info['end_chunk'], start_index) + len(chunk_info['end_chunk'])
 
                 reconstructed_chunks.append(text[start_index:end_index])
                 current_pos = end_index
 
             except ValueError as e:
-                raise ValueError(f"Could not find start/end for chunk {i}: '{chunk_info.start_chunk}' / '{chunk_info.end_chunk}'") from e
+                raise ValueError(f"Could not find start/end for chunk {i}: '{chunk_info['start_chunk']}' / '{chunk_info['end_chunk']}'") from e
 
         return reconstructed_chunks
+
+# Example of use
+if __name__ == "__main__":
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+
+    splitter = SmartSplitter(llm=llm)
+    with open(r"demo_context\about_me.md", "r", encoding="utf-8") as f:
+        text = f.read()
+
+    chunks = splitter.split(text, segmentation_criteria='split into 3 parts')
+
+    for i, chunk in enumerate(chunks):
+        print(f"Chunk {i}: {chunk[:100]}...")
